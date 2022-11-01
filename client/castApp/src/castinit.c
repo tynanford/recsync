@@ -71,13 +71,13 @@ static void casthook(initHookState state)
     Example call: addReccasterEnvVars("SECTOR") or addReccasterEnvVars("SECTOR", "BUILDING")
     Appends the given env variables to the extra_envs list to be sent in addition to the default_envs array
 */
-static void addReccasterEnvVars(int argc, char **argv)
+static void addReccasterEnvVars(caster_t* self, int argc, char **argv)
 {
-    if(argc == 1) {
-        errlogSevPrintf(errlogMinor, "At least one argument expected for %s\n", __func__);
-        return;
-    }
     int i;
+    if(argc < 2) {
+        errlogSevPrintf(errlogMinor, "At least one argument expected for %s\n", __func__);
+        return 1;
+    }
     /* skip first arg since that is the function name */
     for(i = 1; i < argc; i++) {
         if(argv[i] == NULL) {
@@ -88,22 +88,22 @@ static void addReccasterEnvVars(int argc, char **argv)
             errlogSevPrintf(errlogMinor, "Arg is empty for %s\n", __func__);
             continue;
         }
-        epicsMutexMustLock(thecaster.lock);
-        thecaster.extra_envs = realloc(thecaster.extra_envs, sizeof(char *) * (++thecaster.num_extra_envs + 1));
-        epicsMutexUnlock(thecaster.lock);
+        epicsMutexMustLock(self->lock);
+        self->extra_envs = realloc(self->extra_envs, sizeof(char *) * (++self->num_extra_envs + 1));
+        epicsMutexUnlock(self->lock);
 
-        if (thecaster.extra_envs == NULL) {
+        if (self->extra_envs == NULL) {
             errlogSevPrintf(errlogMajor, "Error in memory allocation of extra_envs from %s", __func__);
-            return;
+            return 1;
         }
         const size_t slen = strlen(argv[i]) + 1;
         char *newvar = (char *)calloc(slen, sizeof(char));
         strncpy(newvar, argv[i], slen);
 
-        epicsMutexMustLock(thecaster.lock);
-        thecaster.extra_envs[thecaster.num_extra_envs - 1] = newvar;
-        thecaster.extra_envs[thecaster.num_extra_envs] = NULL;
-        epicsMutexUnlock(thecaster.lock);
+        epicsMutexMustLock(self->lock);
+        self->extra_envs[self->num_extra_envs - 1] = newvar;
+        self->extra_envs[self->num_extra_envs] = NULL;
+        epicsMutexUnlock(self->lock);
     }
 }
 
@@ -112,7 +112,7 @@ static const iocshArg * const addReccasterEnvVarsArgs[] = { &addReccasterEnvVars
 static const iocshFuncDef addReccasterEnvVarsFuncDef = { "addReccasterEnvVars", 1, addReccasterEnvVarsArgs };
 static void addReccasterEnvVarsCallFunc(const iocshArgBuf *args)
 {
-    addReccasterEnvVars(args[0].aval.ac, args[0].aval.av);
+    addReccasterEnvVars(&thecaster, args[0].aval.ac, args[0].aval.av);
 }
 
 static void reccasterRegistrar(void)
