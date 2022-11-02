@@ -79,32 +79,46 @@ static void addReccasterEnvVars(caster_t* self, int argc, char **argv)
         errlogSevPrintf(errlogMinor, "At least one argument expected for %s\n", __func__);
         return;
     }
-    /* sanitize input - check for dups and empty args. First arg in argv is function name so skip that */
     int argCount = argc - 1;
     epicsMutexMustLock(self->lock);
-    for(i = 1; i < argc; i++) {
-        if(argv[i] == NULL) {
-            argCount--;
-            errlogSevPrintf(errlogMinor, "Arg is NULL for %s\n", __func__);
-            continue;
-        }
-        else if(argv[i][0] == '\0') {
-            argCount--;
-            errlogSevPrintf(errlogMinor, "Arg is empty for %s\n", __func__);
-            argv[i] = NULL;
-            continue;
-        }
-        /* check if dup in self->extra_envs. doesn't check if arg is in default_envs right now */
-        for(j = 0; j < self->num_extra_envs; j++) {
-            if(strcmp(argv[i], self->extra_envs[j]) == 0) {
-              argCount--;
-              errlogSevPrintf(errlogMinor, "Env var %s is already in extra_envs list\n", argv[i]);
-              argv[i] = NULL;
-              break;
+    if(self->shutdown) {
+        /* shutdown in progress, silent no-op */
+        ret = 1;
+    }
+    else if(self->current != casterStateInit) {
+        /* Attempt to add after iocInit(), when we may be connected.
+           To fully support, would need to force reconnect or resend w/ updated envs list. */
+        errlogSevPrintf(errlogMinor, "addReccasterEnvVars called after iocInit() when reccaster might already be connected. Not supported\n");
+        ret = 1;
+    }
+    else {
+        /* sanitize input - check for dups and empty args. First arg in argv is function name so skip that */
+        for(i = 1; i < argc; i++) {
+            if(argv[i] == NULL) {
+                argCount--;
+                errlogSevPrintf(errlogMinor, "Arg is NULL for %s\n", __func__);
+                continue;
+            }
+            else if(argv[i][0] == '\0') {
+                argCount--;
+                errlogSevPrintf(errlogMinor, "Arg is empty for %s\n", __func__);
+                argv[i] = NULL;
+                continue;
+            }
+            /* check if dup in self->extra_envs. doesn't check if arg is in default_envs right now */
+            for(j = 0; j < self->num_extra_envs; j++) {
+                if(strcmp(argv[i], self->extra_envs[j]) == 0) {
+                  argCount--;
+                  errlogSevPrintf(errlogMinor, "Env var %s is already in extra_envs list\n", argv[i]);
+                  argv[i] = NULL;
+                  break;
+                }
             }
         }
     }
     epicsMutexUnlock(self->lock);
+    if(ret)
+        return; /* end early if we already hit error condition */
 
     char ** tmp_new_envs;
     tmp_new_envs = calloc(argCount, sizeof(*tmp_new_envs));
@@ -124,18 +138,9 @@ static void addReccasterEnvVars(caster_t* self, int argc, char **argv)
     if(!ret) {
         char ** new_envs;
         epicsMutexMustLock(self->lock);
-        if(self->shutdown) {
-            /* shutdown in progress, silent no-op */
-        }
-        else if(self->current != casterStateInit) {
-            /* 
-              Attempt to add after iocInit(), when we may be connected.
-              To fully support, would need to force reconnect or resend w/ updated envs list.
-            */
-            errlogSevPrintf(errlogMinor, "addReccasterEnvVars called after iocInit() when reccaster might already be connected. Not supported\n");
-        }
-        else if (!(new_envs = realloc(self->extra_envs, sizeof(* new_envs) * (self->num_extra_envs + argCount)))) {
+        if (!(new_envs = realloc(self->extra_envs, sizeof(* new_envs) * (self->num_extra_envs + argCount)))) {
             errlogSevPrintf(errlogMajor, "Error in memory re-allocation of new_envs for self->extra_envs from %s\n", __func__);
+            ret = 1;
         }
         else {
             /* from this point, nothing can fail */
@@ -153,6 +158,9 @@ static void addReccasterEnvVars(caster_t* self, int argc, char **argv)
         free(tmp_new_envs[i]);
     }
     free(tmp_new_envs);
+    if(ret) {
+        errlogSevPrintf(errlogMajor, "Error in %s - reccaster might not send the extra env vars specified\n", __func__);
+    }
 }
 
 static const iocshArg addReccasterEnvVarsArg0 = { "environmentVar", iocshArgArgv };
