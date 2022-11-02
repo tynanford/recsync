@@ -74,10 +74,51 @@ static void casthook(initHookState state)
 static void addReccasterEnvVars(caster_t* self, int argc, char **argv)
 {
     int i;
+    int ret = 0;
     if(argc < 2) {
         errlogSevPrintf(errlogMinor, "At least one argument expected for %s\n", __func__);
-        return 1;
+        return;
     }
+    char ** tmp_new_envs;
+    tmp_new_envs = calloc(argc - 1, sizeof(char *));
+    if(tmp_new_envs == NULL) {
+        errlogSevPrintf(errlogMajor, "Error in memory allocation of tmp_new_envs from %s", __func__);
+        return;
+    }
+    for(i = 0; i < argc - 1 && !ret; i++) {
+        if((tmp_new_envs[i] = strdup(argv[i+1])) == NULL) {
+            ret = 1;
+        }
+    }
+    if(!ret) {
+        epicsMutexMustLock(self->lock);
+        if(self->shutdown) {
+            /* shutdown in progress, silent no-op */
+        }
+        else if(self->state != casterStateInit) {
+            /* Attempt to add after iocInit(), when we may be connected.
+            * To fully support, would need to force reconnect or resend w/ updated envs list.
+            */
+            ret = 2;
+        }
+        else if() {
+            ret = 1;
+        }
+        else {
+
+
+        }
+        epicsMutexUnlock(self->lock);
+    }
+    for(i = 0; i < argc-1 && !ret; i++) {
+        free(tmp_new_envs[i]);
+    }
+    free(tmp_new_envs);
+    if(ret) {
+      // multiple errors could be here
+    }
+    
+
     /* skip first arg since that is the function name */
     for(i = 1; i < argc; i++) {
         if(argv[i] == NULL) {
