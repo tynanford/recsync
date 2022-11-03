@@ -128,14 +128,14 @@ static void addReccasterEnvVars(caster_t* self, int argc, char **argv)
             /* shutdown in progress, silent no-op */
         }
         else if(self->current != casterStateInit) {
-            /* 
-              Attempt to add after iocInit(), when we may be connected.
-              To fully support, would need to force reconnect or resend w/ updated envs list.
-            */
+            /* Attempt to add after iocInit(), when we may be connected.
+               To fully support, would need to force reconnect or resend w/ updated envs list. */
             errlogSevPrintf(errlogMinor, "addReccasterEnvVars called after iocInit() when reccaster might already be connected. Not supported\n");
+            ret = 2;
         }
         else if (!(new_envs = realloc(self->extra_envs, sizeof(* new_envs) * (self->num_extra_envs + argCount)))) {
             errlogSevPrintf(errlogMajor, "Error in memory re-allocation of new_envs for self->extra_envs from %s\n", __func__);
+            ret = 1;
         }
         else {
             /* from this point, nothing can fail */
@@ -153,6 +153,10 @@ static void addReccasterEnvVars(caster_t* self, int argc, char **argv)
         free(tmp_new_envs[i]);
     }
     free(tmp_new_envs);
+    if(ret) {
+        errlogSevPrintf(errlogMajor, "Error in %s - reccaster might not send the extra env vars specified\n", __func__);
+    }
+
 }
 
 static const iocshArg addReccasterEnvVarsArg0 = { "environmentVar", iocshArgArgv };
