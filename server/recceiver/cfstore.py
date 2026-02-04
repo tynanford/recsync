@@ -30,8 +30,15 @@ RECCEIVERID_DEFAULT = socket.gethostname()
 DEFAULT_MAX_CHANNEL_NAME_QUERY_LENGTH = 600
 DEFAULT_QUERY_LIMIT = 10_000
 
+try:
+    StrEnum = enum.StrEnum  # Python 3.11+
+except AttributeError:
 
-class PVStatus(enum.StrEnum):
+    class StrEnum(str, enum.Enum):
+        pass
+
+
+class PVStatus(StrEnum):
     """PV Status values."""
 
     ACTIVE = "Active"
@@ -170,7 +177,7 @@ class RecordInfo:
     aliases: List[str] = field(default_factory=list)
 
 
-class CFPropertyName(enum.StrEnum):
+class CFPropertyName(StrEnum):
     """Standard property names used in Channelfinder."""
 
     HOSTNAME = "hostName"
