@@ -6,7 +6,7 @@ COPY . ./server
 
 RUN python -m venv venv
 
-RUN venv/bin/python -m pip install ./server
+RUN venv/bin/python -m pip install "./server[metrics]"
 
 FROM python:3.9-alpine
 
