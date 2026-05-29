@@ -2,9 +2,10 @@ name: Release docker image
 
 on:
   push:
-    branches: [ "*" ]
+    branches: [ "*", "*/*" ]
     paths:
       - server/**
+      - .github/workflows/docker.yml
     tags:
       - '**'
 
