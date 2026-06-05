@@ -179,6 +179,7 @@ class CastReceiver(stateful.StatefulProtocol):
             log.error("Ignoring done update")
             return self.getInitialState()
         self.factory.isDone(self, self.active)
+        self.active = False  # slot freed; connectionLost must not free it again
         self.sess.done()
         if self.phase == 1:
             self.writePing()
@@ -370,8 +371,10 @@ class CastFactory(protocol.ServerFactory):
 
     def isDone(self, proto, active):
         if not active:
-            # connection closed before activation
-            self.Wait.remove(proto)
+            # connection closed before activation; guard: proto may no longer be in Wait
+            # if recvDone already freed the slot and cleared self.active
+            if proto in self.Wait:
+                self.Wait.remove(proto)
         elif len(self.Wait) > 0:
             # Others are waiting
             waiting = self.Wait.pop(0)

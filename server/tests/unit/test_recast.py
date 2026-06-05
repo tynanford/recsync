@@ -91,6 +91,33 @@ class TestCastFactoryThrottling:
 
         assert factory.Wait == []
 
+    def test_nactive_not_decremented_twice_after_successful_upload(self):
+        """NActive must only drop by 1 across the full recvDone→connectionLost cycle."""
+        factory = self._make_factory(max_active=2)
+        p1 = factory.buildProtocol(None)
+        assert factory.NActive == 1
+
+        # recvDone fires: frees the slot
+        factory.isDone(p1, active=True)
+        p1.active = False  # recvDone clears the flag after isDone
+        assert factory.NActive == 0
+
+        # connectionLost fires: must be a no-op (active is now False, not in Wait)
+        factory.isDone(p1, active=False)
+        assert factory.NActive == 0  # must NOT go to -1
+
+    def test_is_done_inactive_proto_not_in_wait_is_no_op(self):
+        """isDone with active=False for a proto not in Wait must not raise or modify state."""
+        factory = self._make_factory(max_active=1)
+        p1 = factory.buildProtocol(None)
+
+        factory.isDone(p1, active=True)  # NActive → 0
+        assert factory.NActive == 0
+
+        # proto is not in Wait — must not raise ValueError from list.remove()
+        factory.isDone(p1, active=False)
+        assert factory.NActive == 0
+
 
 class TestCollectionSessionAbort:
     def test_disconnect_commit_runs_after_data_commit_cancels(self):
