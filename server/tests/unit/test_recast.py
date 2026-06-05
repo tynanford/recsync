@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 from twisted.internet import defer
 from twisted.internet.address import IPv4Address
 
-from recceiver.recast import CastFactory, CollectionSession
+from recceiver.recast import CastFactory, CastReceiver, CollectionSession
 
 
 def _make_session() -> CollectionSession:
@@ -77,6 +77,19 @@ class TestCastFactoryThrottling:
         p2.connectionMade.assert_called_once()
         assert len(factory.Wait) == 1
         assert factory.Wait[0] is p3
+
+    def test_connection_lost_on_throttled_connection_does_not_raise(self):
+        """A waiting (inactive) connection that closes before promotion must not raise."""
+        factory = self._make_factory(max_active=1)
+        proto = CastReceiver(active=False)
+        proto.factory = factory
+        factory.Wait.append(proto)  # register as a waiting connection, as buildProtocol would
+        proto.sess = None  # no session opened for inactive connections
+
+        # Must not raise AttributeError: 'CastReceiver' object has no attribute '_ping_timer'
+        proto.connectionLost()
+
+        assert factory.Wait == []
 
 
 class TestCollectionSessionAbort:

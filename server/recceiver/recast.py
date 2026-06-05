@@ -29,6 +29,7 @@ class CastReceiver(stateful.StatefulProtocol):
 
         self.sess, self.active = None, active
         self.uploadSize, self.uploadStart = 0, 0
+        self._ping_timer = None  # connectionLost guards on this; connectionMade may not set it
 
         self.rxfn = collections.defaultdict(self.dfact)
 
@@ -58,7 +59,7 @@ class CastReceiver(stateful.StatefulProtocol):
         self.factory.isDone(self, self.active)
         if self._ping_timer and self._ping_timer.active():
             self._ping_timer.cancel()
-        del self._ping_timer
+        self._ping_timer = None
         if self.sess:
             self.sess.close()
         del self.sess
