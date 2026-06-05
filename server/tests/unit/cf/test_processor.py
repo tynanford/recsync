@@ -3,12 +3,23 @@ import time
 import pytest
 from requests import RequestException
 from twisted.internet import defer
+from twisted.internet.address import IPv4Address
 
 from recceiver.cf.model import CFChannel, CFProperty, CFPropertyName, PVStatus, RecordInfo
 from recceiver.cf.processor import CFProcessor
+from recceiver.recast import Transaction
 from tests.unit.cf.conftest import DEFAULT_RECCEIVER_ID, make_channel, make_ioc
 from tests.unit.cf.mock_adapter import MockCFAdapter
 from tests.unit.conftest import make_adapter
+
+_HOST_A = "1.2.3.4"  # NOSONAR
+
+
+def make_transaction(host: str, port: int) -> Transaction:
+    ep = IPv4Address("TCP", host, port)
+    t = Transaction(ep, id=0)
+    t.initial = True
+    return t
 
 
 def make_processor() -> CFProcessor:
@@ -129,20 +140,20 @@ class TestUpdateChannelFinder:
         proc, adapter = self._make_proc()
 
         ioc_a = IOCInfo(
-            host="1.2.3.4",
+            host="1.2.3.4",  # NOSONAR
             hostname="ioc-a.example.com",
             ioc_name="IOC-A",
-            ioc_ip="1.2.3.4",
+            ioc_ip="1.2.3.4",  # NOSONAR
             owner="admin",
             time="2026-01-01T00:00:00",
             port=5064,
             channelcount=0,
         )
         ioc_b = IOCInfo(
-            host="5.6.7.8",
+            host="5.6.7.8",  # NOSONAR
             hostname="ioc-b.example.com",
             ioc_name="IOC-B",
-            ioc_ip="5.6.7.8",
+            ioc_ip="5.6.7.8",  # NOSONAR
             owner="admin",
             time="2026-01-01T00:00:00",
             port=5064,
@@ -230,3 +241,56 @@ class TestPushToCF:
 
         with pytest.raises(defer.CancelledError):
             processor._push_to_cf({}, [], ioc)
+
+
+class TestEvictIoc:
+    def test_evict_ioc_removes_all_tracking_state(self):
+        proc = make_processor()
+        ioc = make_ioc(channelcount=2)
+        iocid = ioc.id
+        proc.iocs[iocid] = ioc
+        proc._ioc_channels[iocid].add("PV:1")
+        proc._ioc_channels[iocid].add("PV:2")
+        proc.channel_ioc_ids["PV:1"].append(iocid)
+        proc.channel_ioc_ids["PV:2"].append(iocid)
+
+        proc._evict_ioc(iocid)
+
+        assert iocid not in proc.iocs
+        assert iocid not in proc._ioc_channels
+        assert "PV:1" not in proc.channel_ioc_ids
+        assert "PV:2" not in proc.channel_ioc_ids
+
+    def test_evict_ioc_is_noop_for_unknown_ioc(self):
+        proc = make_processor()
+        proc._evict_ioc("1.2.3.4:5064")  # NOSONAR — must not raise
+
+    def test_commit_thread_evicts_ioc_on_push_failure(self, monkeypatch):
+        """On retry exhaustion for a connected transaction, IOC is evicted from memory."""
+        proc = make_processor()
+        proc.running = True
+        ioc = make_ioc(channelcount=1)
+        iocid = ioc.id
+
+        # Pre-populate state as update_ioc_infos would have done
+        proc.iocs[iocid] = ioc
+        proc._ioc_channels[iocid].add("PV:1")
+        proc.channel_ioc_ids["PV:1"].append(iocid)
+
+        # Skip update_ioc_infos (state already set up) and fail the CF push
+        monkeypatch.setattr(proc, "update_ioc_infos", lambda *a: None)
+        monkeypatch.setattr(proc, "_push_to_cf", lambda *a: False)
+        monkeypatch.setattr(proc, "transaction_to_record_infos", lambda *a: {})
+        monkeypatch.setattr(CFProcessor, "record_info_by_name", staticmethod(lambda *a: {}))
+
+        t = make_transaction(_HOST_A, 5064)
+        t.connected = True
+        t.records_to_delete = []
+        t.client_infos = {"IOCNAME": "TEST-IOC", "HOSTNAME": "test.host"}
+
+        with pytest.raises(defer.CancelledError):
+            proc._commit_with_thread(t)
+
+        assert iocid not in proc.iocs
+        assert iocid not in proc._ioc_channels
+        assert "PV:1" not in proc.channel_ioc_ids

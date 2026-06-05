@@ -399,7 +399,21 @@ class CFProcessor(service.Service):
         self.update_ioc_infos(transaction, ioc_info, records_to_delete, record_info_by_name)
         poll_success = self._push_to_cf(record_info_by_name, records_to_delete, ioc_info)
         if not poll_success:
+            if transaction.connected:
+                self._evict_ioc(ioc_info.id)
             raise defer.CancelledError(f"Failed to commit transaction after polling retries: {transaction}")
+
+    def _evict_ioc(self, iocid: str) -> None:
+        """Remove an IOC from in-memory state so its next commit is treated as initial.
+
+        Called after a CF push exhausts retries: CF was never written, so
+        in-memory state would diverge from CF until the IOC reconnects.
+        """
+        # list() snapshots the set; remove_channel mutates it during iteration
+        for ch in list(self._ioc_channels.get(iocid, set())):  # NOSONAR
+            self.remove_channel(ch, iocid)
+        self.iocs.pop(iocid, None)
+        self._ioc_channels.pop(iocid, None)
 
     def remove_channel(self, record_name: str, iocid: str) -> None:
         """Unlink a channel from an IOC in channel_ioc_ids and decrement channelcount.
