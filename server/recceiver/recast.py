@@ -363,9 +363,9 @@ class CastFactory(protocol.ServerFactory):
     maxActive = 3
 
     def __init__(self):
-        # Throttle concurrent uploading connections to control CF commit load.
-        # "Active" means currently uploading records; connections become
-        # "inactive" via isDone() once the upload completes.
+        # Flow control by limiting the number of concurrent
+        # "active" connections. Active means dumping lots of records.
+        # Connections become "inactive" by calling isDone().
         self.NActive = 0
         self.Wait = []
 
