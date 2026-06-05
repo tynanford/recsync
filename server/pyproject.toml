@@ -39,6 +39,7 @@ dependencies = [
 optional-dependencies.metrics = [ "prometheus-client" ]
 optional-dependencies.test = [ "pytest>=8.3,<8.4", "pytest-cov>=6,<7", "testcontainers>=4.8.2,<4.9" ]
 urls.Repository = "https://github.com/ChannelFinder/recsync"
+scripts.recceiver-clean = "recceiver.clean_tool:main"
 
 [tool.setuptools]
 packages = [ "recceiver", "recceiver.cf", "recceiver.protocol", "twisted.plugins" ]
