@@ -136,11 +136,15 @@ class RecService(service.MultiService):
             self._statusLoop.start(self.statusInterval, now=False)
 
     def _logStatus(self):
-        metrics.connections_active.set(self.tcpFactory.NActive)
+        nactive = self.tcpFactory.NActive
+        if nactive < 0:
+            log.warning("NActive is %d — connection accounting is corrupted", nactive)
+        nactive = max(0, nactive)
+        metrics.connections_active.set(nactive)
         metrics.connections_waiting.set(len(self.tcpFactory.Wait))
         log.info(
             "status: connections active=%d/%d queued=%d",
-            self.tcpFactory.NActive,
+            nactive,
             self.tcpFactory.maxActive,
             len(self.tcpFactory.Wait),
         )
