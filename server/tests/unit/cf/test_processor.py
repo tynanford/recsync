@@ -122,6 +122,61 @@ class TestUpdateChannelFinder:
         status = next(p for p in adapter._channels["PV:1"].properties if p.name == CFPropertyName.PV_STATUS.value)
         assert status.value == PVStatus.INACTIVE.value
 
+    def test_handle_channel_is_old_missing_last_ioc_does_not_raise(self):
+        """If the last known IOC for a channel has departed, orphan the channel rather than raise."""
+        from recceiver.cf.model import IOCInfo
+
+        proc, adapter = self._make_proc()
+
+        ioc_a = IOCInfo(
+            host="1.2.3.4",
+            hostname="ioc-a.example.com",
+            ioc_name="IOC-A",
+            ioc_ip="1.2.3.4",
+            owner="admin",
+            time="2026-01-01T00:00:00",
+            port=5064,
+            channelcount=0,
+        )
+        ioc_b = IOCInfo(
+            host="5.6.7.8",
+            hostname="ioc-b.example.com",
+            ioc_name="IOC-B",
+            ioc_ip="5.6.7.8",
+            owner="admin",
+            time="2026-01-01T00:00:00",
+            port=5064,
+            channelcount=0,
+        )
+        ioc_a_id = ioc_a.id  # "1.2.3.4:5064"
+        ioc_b_id = ioc_b.id  # "5.6.7.8:5064"
+
+        # PV:1 was last seen under IOC-A, which has since departed
+        proc.channel_ioc_ids["PV:1"].append(ioc_a_id)
+        # ioc_a deliberately absent from proc.iocs
+        proc.iocs[ioc_b_id] = ioc_b
+
+        # CF has PV:1 registered under IOC-B (by iocid property)
+        adapter.set_channels(
+            [
+                CFChannel(
+                    "PV:1",
+                    "admin",
+                    [
+                        CFProperty(CFPropertyName.PV_STATUS.value, "admin", PVStatus.ACTIVE.value),
+                        CFProperty(CFPropertyName.IOC_ID.value, "admin", ioc_b_id),
+                    ],
+                )
+            ]
+        )
+
+        # IOC-B commits with no channels — PV:1 appears in old_channels, triggers _handle_channel_is_old
+        proc._update_channelfinder({}, [], ioc_b)
+
+        # Must not raise KeyError; PV:1 should be orphaned (marked Inactive)
+        status = next(p for p in adapter._channels["PV:1"].properties if p.name == CFPropertyName.PV_STATUS.value)
+        assert status.value == PVStatus.INACTIVE.value
+
 
 class TestPushToCF:
     def test_abandons_push_when_processor_stops_during_retry(self, monkeypatch):

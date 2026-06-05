@@ -648,7 +648,16 @@ class CFProcessor(service.Service):
     ) -> None:
         """Channel exists in CF but not in this commit — re-assign to its last known IOC."""
         last_ioc_id = self.channel_ioc_ids[cf_channel.name][-1]
-        cf_channel.owner = self.iocs[last_ioc_id].owner
+        last_ioc_info = self.iocs.get(last_ioc_id)
+        if last_ioc_info is None:
+            log.warning(
+                "Last IOC %s for channel %s not in local state; orphaning channel",
+                last_ioc_id,
+                cf_channel.name,
+            )
+            self._orphan_channel(cf_channel, ioc_info, channels, record_info_by_name)
+            return
+        cf_channel.owner = last_ioc_info.owner
         cf_channel.properties = _merge_property_lists(
             create_default_properties(ioc_info, recceiverid, self.channel_ioc_ids, self.iocs, cf_channel),
             cf_channel,
@@ -663,7 +672,10 @@ class CFProcessor(service.Service):
                     alias_channel = CFChannel(alias_name, "", [])
                     if alias_name in self.channel_ioc_ids:
                         last_alias_ioc_id = self.channel_ioc_ids[alias_name][-1]
-                        alias_channel.owner = self.iocs[last_alias_ioc_id].owner
+                        last_alias_ioc_info = self.iocs.get(last_alias_ioc_id)
+                        if last_alias_ioc_info is None:
+                            continue
+                        alias_channel.owner = last_alias_ioc_info.owner
                         alias_channel.properties = _merge_property_lists(
                             create_default_properties(
                                 ioc_info, recceiverid, self.channel_ioc_ids, self.iocs, cf_channel
