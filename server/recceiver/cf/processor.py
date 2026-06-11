@@ -658,11 +658,10 @@ class CFProcessor(service.Service):
                         )
                 else:
                     self._orphan_channel(cf_channel, ioc_info, channels, record_info_by_name)
-            else:
-                if cf_channel.name in new_channels:
-                    self._handle_channel_old_and_new(
-                        cf_channel, iocid, ioc_info, channels, new_channels, record_info_by_name, old_channels
-                    )
+            elif cf_channel.name in new_channels:
+                self._handle_channel_old_and_new(
+                    cf_channel, iocid, ioc_info, channels, new_channels, record_info_by_name, old_channels
+                )
 
     def _handle_channel_is_old(
         self,
