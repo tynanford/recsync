@@ -643,7 +643,19 @@ class CFProcessor(service.Service):
             if not new_channels or cf_channel.name in records_to_delete:
                 log.debug("Channel %s exists in Channelfinder not in new_channels", cf_channel)
                 if cf_channel.name in self.channel_ioc_ids:
-                    self._handle_channel_is_old(cf_channel, ioc_info, recceiverid, channels, record_info_by_name)
+                    last_ioc_id = self.channel_ioc_ids[cf_channel.name][-1]
+                    last_ioc_info = self.iocs.get(last_ioc_id)
+                    if last_ioc_info is None:
+                        log.warning(
+                            "Last IOC %s for channel %s not in local state; orphaning channel",
+                            last_ioc_id,
+                            cf_channel.name,
+                        )
+                        self._orphan_channel(cf_channel, ioc_info, channels, record_info_by_name)
+                    else:
+                        self._handle_channel_is_old(
+                            cf_channel, ioc_info, recceiverid, channels, record_info_by_name, last_ioc_id, last_ioc_info
+                        )
                 else:
                     self._orphan_channel(cf_channel, ioc_info, channels, record_info_by_name)
             else:
@@ -659,18 +671,15 @@ class CFProcessor(service.Service):
         recceiverid: str,
         channels: List[CFChannel],
         record_info_by_name: Dict[str, RecordInfo],
+        last_ioc_id: str,
+        last_ioc_info: IOCInfo,
     ) -> None:
-        """Channel exists in CF but not in this commit — re-assign to its last known IOC."""
-        last_ioc_id = self.channel_ioc_ids[cf_channel.name][-1]
-        last_ioc_info = self.iocs.get(last_ioc_id)
-        if last_ioc_info is None:
-            log.warning(
-                "Last IOC %s for channel %s not in local state; orphaning channel",
-                last_ioc_id,
-                cf_channel.name,
-            )
-            self._orphan_channel(cf_channel, ioc_info, channels, record_info_by_name)
-            return
+        """Re-assign a CF channel to its last known IOC.
+
+        Called when a channel exists in CF but not in the current commit and its last
+        known IOC is still in local state. Caller is responsible for the None check on
+        last_ioc_info and must orphan the channel instead when it is absent.
+        """
         cf_channel.owner = last_ioc_info.owner
         cf_channel.properties = _merge_property_lists(
             create_default_properties(ioc_info, recceiverid, self.channel_ioc_ids, self.iocs, cf_channel),
