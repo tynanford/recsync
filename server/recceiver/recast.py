@@ -29,6 +29,7 @@ class CastReceiver(stateful.StatefulProtocol):
 
         self.sess, self.active = None, active
         self.uploadSize, self.uploadStart = 0, 0
+        self._ping_timer = None  # connectionLost guards on this; connectionMade may not set it
 
         self.rxfn = collections.defaultdict(self.dfact)
 
@@ -58,7 +59,7 @@ class CastReceiver(stateful.StatefulProtocol):
         self.factory.isDone(self, self.active)
         if self._ping_timer and self._ping_timer.active():
             self._ping_timer.cancel()
-        del self._ping_timer
+        self._ping_timer = None
         if self.sess:
             self.sess.close()
         del self.sess
@@ -178,6 +179,7 @@ class CastReceiver(stateful.StatefulProtocol):
             log.error("Ignoring done update")
             return self.getInitialState()
         self.factory.isDone(self, self.active)
+        self.active = False  # slot freed; connectionLost must not free it again
         self.sess.done()
         if self.phase == 1:
             self.writePing()
@@ -361,16 +363,18 @@ class CastFactory(protocol.ServerFactory):
     maxActive = 3
 
     def __init__(self):
-        # Throttle concurrent uploading connections to control CF commit load.
-        # "Active" means currently uploading records; connections become
-        # "inactive" via isDone() once the upload completes.
+        # Flow control by limiting the number of concurrent
+        # "active" connections. Active means dumping lots of records.
+        # Connections become "inactive" by calling isDone().
         self.NActive = 0
         self.Wait = []
 
     def isDone(self, proto, active):
         if not active:
-            # connection closed before activation
-            self.Wait.remove(proto)
+            # connection closed before activation; guard: proto may no longer be in Wait
+            # if recvDone already freed the slot and cleared self.active
+            if proto in self.Wait:
+                self.Wait.remove(proto)
         elif len(self.Wait) > 0:
             # Others are waiting
             waiting = self.Wait.pop(0)

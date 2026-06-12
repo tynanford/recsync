@@ -1,6 +1,5 @@
 import datetime
 import logging
-import threading
 import time
 from collections import defaultdict
 from typing import Callable, Dict, List, Optional, Set
@@ -30,10 +29,6 @@ from recceiver.processors import ConfigAdapter
 log = logging.getLogger(__name__)
 
 
-class CFUpdateAbortedError(Exception):
-    """Raised when a CF push is abandoned after exhausting all retries."""
-
-
 @implementer(interfaces.IProcessor)
 class CFProcessor(service.Service):
     """IProcessor plugin that synchronises IOC record data to Channelfinder.
@@ -49,11 +44,8 @@ class CFProcessor(service.Service):
         self.iocs: Dict[str, IOCInfo] = {}
         self.client: Optional[ChannelFinderAdapter] = None
         self.current_time: Callable[[Optional[str]], str] = get_current_time
-        self.lock: DeferredLock = DeferredLock()  # lifecycle lock: serialises start/stop
-        self._ioc_locks: Dict[str, DeferredLock] = {}
+        self.lock: DeferredLock = DeferredLock()
         self._ioc_channels: Dict[str, Set[str]] = defaultdict(set)  # iocid → set of channel names
-        self._state_lock: threading.Lock = threading.Lock()
-        self._cancelled: Dict[str, bool] = {}
         self._statusLoop = None
 
     def startService(self):
@@ -166,74 +158,67 @@ class CFProcessor(service.Service):
     def _stop_service_with_lock(self):
         """Stop the CFProcessor service with lock held.
 
-        If clean_on_stop is enabled, drain all in-flight per-IOC commits
-        first, then mark all channels inactive in a background thread.
-        Commits use _ioc_locks rather than self.lock and can still be running
-        when this is called; the drain waits for each lock before the sweep.
+        If clean_on_stop is enabled, mark all channels as inactive.
+        The sweep runs in a background thread to avoid blocking the reactor.
+        The lock is held throughout, preventing new commits from interleaving.
         """
         log.info("CF_STOP with lock")
         if self.cf_config.clean_on_stop:
-            drains = [lock.run(lambda: None) for lock in self._ioc_locks.values()]
-            d = defer.DeferredList(drains, consumeErrors=True)
-            d.addCallback(lambda _: deferToThread(self.clean_service))
-            return d
+            return deferToThread(self.clean_service)
 
     def _start_background_clean(self):
         log.info("CF Clean: background startup sweep beginning")
         deferToThread(self.clean_service).addErrback(lambda err: log.error("CF Clean background sweep failed: %s", err))
 
-    def _get_ioc_lock(self, iocid: str) -> DeferredLock:
-        """Return the per-IOC DeferredLock, creating it on first use.
-
-        Must only be called from the reactor thread.
-        """
-        if iocid not in self._ioc_locks:
-            self._ioc_locks[iocid] = DeferredLock()
-        return self._ioc_locks[iocid]
-
-    def _prune_ioc_state(self, result, iocid: str):
-        """Remove per-IOC bookkeeping once an IOC has fully departed.
-
-        Called after the per-IOC lock is released. Only prunes when the lock
-        is free (no new commit queued) and the IOC is no longer in self.iocs.
-        Always returns result so it is safe to use with addBoth.
-        """
-        lock = self._ioc_locks.get(iocid)
-        if lock is not None and not lock.locked and iocid not in self.iocs:
-            self._ioc_locks.pop(iocid, None)
-            self._cancelled.pop(iocid, None)
-            self._ioc_channels.pop(iocid, None)
-        return result
-
     def commit(self, transaction_record: interfaces.ITransaction) -> defer.Deferred:
-        """Commit a transaction to Channelfinder.
+        """Commit a transaction to Channelfinder."""
+        return self.lock.run(self._commit_with_lock, transaction_record)
 
-        Uses a per-IOC DeferredLock so commits from different IOCs run in
-        parallel while transactions from the same IOC stay serialised.
+    def _commit_with_lock(self, transaction: interfaces.ITransaction) -> defer.Deferred:
+        """Bridge the blocking commit thread to a cancellable Deferred.
+
+        Spawns _commit_with_thread in a thread, then wires a separate cancellable
+        Deferred (d) around it so that cancelling d (e.g. on service stop) sets
+        self.cancelled=True, which _assert_not_cancelled picks up mid-push.
         """
-        iocid = f"{transaction_record.source_address.host}:{transaction_record.source_address.port}"
-        lock = self._get_ioc_lock(iocid)
-        d = lock.run(self._commit_with_lock, transaction_record, iocid)
-        d.addBoth(self._prune_ioc_state, iocid)
-        return d
+        self.cancelled = False
 
-    @defer.inlineCallbacks
-    def _commit_with_lock(self, transaction: interfaces.ITransaction, iocid: str) -> defer.Deferred:
-        self._cancelled[iocid] = False
-        try:
-            result = yield deferToThread(self._prepare_commit, transaction, iocid)
-            if result is None:
-                return  # disconnect-before-upload: nothing to push
-            ioc_info, record_info_by_name, records_to_delete, iocs_snap, ciids_snap = result
-            yield self._push_to_cf_async(iocid, record_info_by_name, records_to_delete, ioc_info, iocs_snap, ciids_snap)
-        except defer.CancelledError as err:
-            log.debug("CF_COMMIT cancelled for %s: %s", iocid, err)
-            raise
-        except CFUpdateAbortedError as err:
-            log.exception("CF_COMMIT ABORTED after exhausting retries: %s", err)
-        except Exception as err:
-            log.exception("CF_COMMIT FAILURE: %s", err)
-            raise
+        t = deferToThread(self._commit_with_thread, transaction)
+
+        def cancel_commit(d: defer.Deferred):
+            self.cancelled = True
+            d.callback(None)
+
+        d: defer.Deferred = defer.Deferred(cancel_commit)
+
+        def wait_for_thread(_ignored):
+            if self.cancelled:
+                return t
+
+        d.addCallback(wait_for_thread)
+
+        def chain_error(err):
+            """Handle errors from the commit thread.
+
+            Note this is not foolproof as the thread may still be running.
+            """
+            if not err.check(defer.CancelledError):
+                log.error("CF_COMMIT FAILURE: %s", err)
+            if self.cancelled:
+                if not err.check(defer.CancelledError):
+                    raise defer.CancelledError()
+                return err
+            else:
+                d.callback(None)
+
+        def chain_result(result):
+            if self.cancelled:
+                raise defer.CancelledError(f"CF Processor is cancelled, due to {result}")
+            else:
+                d.callback(None)
+
+        t.addCallbacks(chain_result, chain_error)
+        return d
 
     def transaction_to_record_infos(
         self, ioc_info: IOCInfo, transaction: interfaces.ITransaction
@@ -346,14 +331,12 @@ class CFProcessor(service.Service):
         for alias in aliases:
             self.remove_channel(alias, iocid)
 
-    def _prepare_commit(self, transaction: interfaces.ITransaction, iocid: str):
-        """Build IOC/record state and update shared dicts under _state_lock.
+    def _commit_with_thread(self, transaction: interfaces.ITransaction):
+        """Execute a commit transaction in a background thread.
 
-        Returns a tuple of (ioc_info, record_info_by_name, records_to_delete,
-        iocs_snapshot, channel_ioc_ids_snapshot) ready for the CF push, or
-        None if the IOC disconnected before completing its initial upload.
-
-        Runs in a thread pool thread; must not touch the reactor.
+        Extracts IOC identity from transaction metadata, updates in-memory
+        channel/IOC state, then calls _push_to_cf. Raises CancelledError on
+        push failure so the Twisted caller sees a failed Deferred.
         """
         host = transaction.source_address.host
         port = transaction.source_address.port
@@ -401,81 +384,36 @@ class CFProcessor(service.Service):
         )
 
         record_infos = self.transaction_to_record_infos(ioc_info, transaction)
+
         records_to_delete = list(transaction.records_to_delete)
         log.debug("Delete records: %s", records_to_delete)
-        record_info_by_name = CFProcessor.record_info_by_name(record_infos, ioc_info)
 
+        record_info_by_name = CFProcessor.record_info_by_name(record_infos, ioc_info)
         if not transaction.connected and ioc_info.id not in self.iocs:
             log.warning(
                 "IOC at %s:%d disconnected before completing initial upload (0 channels registered)",
                 host,
                 port,
             )
-            return None
+            return
+        self.update_ioc_infos(transaction, ioc_info, records_to_delete, record_info_by_name)
+        poll_success = self._push_to_cf(record_info_by_name, records_to_delete, ioc_info)
+        if not poll_success:
+            if transaction.connected:
+                self._evict_ioc(ioc_info.id)
+            raise defer.CancelledError(f"Failed to commit transaction after polling retries: {transaction}")
 
-        with self._state_lock:
-            self.update_ioc_infos(transaction, ioc_info, records_to_delete, record_info_by_name)
-            iocs_snap = dict(self.iocs)
-            # Snapshot only channels this IOC owns plus any being deleted; that
-            # covers everything _handle_channel_is_old can look up without
-            # cloning the full channel map on every commit.
-            channels_to_snapshot = set(records_to_delete) | self._ioc_channels.get(iocid, set())
-            ciids_snap = {k: list(self.channel_ioc_ids[k]) for k in channels_to_snapshot if k in self.channel_ioc_ids}
+    def _evict_ioc(self, iocid: str) -> None:
+        """Remove an IOC from in-memory state so its next commit is treated as initial.
 
-        return ioc_info, record_info_by_name, records_to_delete, iocs_snap, ciids_snap
-
-    @defer.inlineCallbacks
-    def _push_to_cf_async(
-        self,
-        iocid: str,
-        record_info_by_name: Dict[str, "RecordInfo"],
-        records_to_delete: List[str],
-        ioc_info: "IOCInfo",
-        iocs: Dict[str, "IOCInfo"],
-        channel_ioc_ids: Dict[str, List[str]],
-    ) -> defer.Deferred:
-        """Retry CF update until success, service stop, or retry limit.
-
-        Each CF call runs in a thread pool thread via deferToThread. Retry
-        waits use task.deferLater so no thread is held between attempts.
+        Called after a CF push exhausts retries: CF was never written, so
+        in-memory state would diverge from CF until the IOC reconnects.
         """
-        from twisted.internet import reactor
-
-        count = 0
-        sleep = 1.0
-        log.info("CF push start: %s (%d channels)", ioc_info, len(record_info_by_name))
-        while self.cf_config.push_always_retry or count < self.cf_config.push_max_retries:
-            if not self.running or self._cancelled.get(iocid, False):
-                log.info("CF processor stopped; abandoning push for %s after %d attempt(s)", ioc_info, count)
-                return
-            count += 1
-            t0 = time.monotonic()
-            try:
-                yield deferToThread(
-                    self._update_channelfinder, record_info_by_name, records_to_delete, ioc_info, iocs, channel_ioc_ids
-                )
-                elapsed = time.monotonic() - t0
-                metrics.cf_commit_duration_seconds.observe(elapsed)
-                metrics.cf_commits_total.labels(result="success").inc()
-                log.info("CF push done in %.2fs: %s (%d channels)", elapsed, ioc_info, len(record_info_by_name))
-                return
-            except defer.CancelledError:
-                self._cancelled[iocid] = True
-                raise
-            except RequestException:
-                elapsed = time.monotonic() - t0
-                log.exception("CF push failed after %.2fs (attempt %d): %s", elapsed, count, ioc_info)
-                retry_seconds = min(60.0, sleep)
-                log.info("CF push retry in %s seconds", retry_seconds)
-                try:
-                    yield task.deferLater(reactor, retry_seconds, lambda: None)
-                except defer.CancelledError:
-                    self._cancelled[iocid] = True
-                    raise
-                sleep *= 1.5
-        metrics.cf_commits_total.labels(result="cancelled").inc()
-        log.error("CF push gave up after %d attempts: %s", count, ioc_info)
-        raise CFUpdateAbortedError(f"Failed to commit transaction after {count} attempts: {ioc_info}")
+        # list() snapshots the set; remove_channel mutates it during iteration
+        for ch in list(self._ioc_channels.get(iocid, set())):  # NOSONAR
+            self.remove_channel(ch, iocid)
+        self.iocs.pop(iocid, None)
+        self._ioc_channels.pop(iocid, None)
 
     def remove_channel(self, record_name: str, iocid: str) -> None:
         """Unlink a channel from an IOC in channel_ioc_ids and decrement channelcount.
@@ -533,8 +471,46 @@ class CFProcessor(service.Service):
         log.debug('Update "pvStatus" property to "Inactive" for %s channels', len(names))
         self.client.update_property(CFProperty(CFPropertyName.PV_STATUS.value, owner, PVStatus.INACTIVE.value), names)
 
-    def _assert_not_cancelled(self, iocid: str, context: str) -> None:
-        if self._cancelled.get(iocid, False) or not self.running:
+    def _push_to_cf(
+        self,
+        record_info_by_name: Dict[str, RecordInfo],
+        records_to_delete: List[str],
+        ioc_info: IOCInfo,
+    ) -> bool:
+        """Call _update_channelfinder with exponential back-off.
+
+        Returns True on success, False if the processor was stopped or the retry
+        budget (push_max_retries) was exhausted. Blocks the calling thread.
+        """
+        log.info("CF push start: %s (%d channels)", ioc_info, len(record_info_by_name))
+        count = 0
+        sleep = 1.0
+        while self.cf_config.push_always_retry or count < self.cf_config.push_max_retries:
+            if not self.running:
+                log.info("CF processor stopped; abandoning push for %s after %d attempt(s)", ioc_info, count)
+                return False
+            count += 1
+            t0 = time.monotonic()
+            try:
+                self._update_channelfinder(record_info_by_name, records_to_delete, ioc_info)
+                elapsed = time.monotonic() - t0
+                metrics.cf_commit_duration_seconds.observe(elapsed)
+                metrics.cf_commits_total.labels(result="success").inc()
+                log.info("CF push done in %.2fs: %s (%d channels)", elapsed, ioc_info, len(record_info_by_name))
+                return True
+            except RequestException:
+                elapsed = time.monotonic() - t0
+                log.exception("CF push failed after %.2fs (attempt %d): %s", elapsed, count, ioc_info)
+                retry_seconds = min(60, sleep)
+                log.info("CF push retry in %s seconds", retry_seconds)
+                time.sleep(retry_seconds)
+                sleep *= 1.5
+        metrics.cf_commits_total.labels(result="cancelled").inc()
+        log.error("CF push gave up after %d attempts: %s", count, ioc_info)
+        return False
+
+    def _assert_not_cancelled(self, context: str) -> None:
+        if self.cancelled:
             raise defer.CancelledError(f"Processor cancelled: {context}")
 
     def _update_channelfinder(
@@ -542,13 +518,13 @@ class CFProcessor(service.Service):
         record_info_by_name: Dict[str, RecordInfo],
         records_to_delete: List[str],
         ioc_info: IOCInfo,
-        iocs: Dict[str, IOCInfo],
-        channel_ioc_ids: Dict[str, List[str]],
     ) -> None:
-        """Push one IOC's changes to ChannelFinder.
+        """Compute and push the minimal CF diff for one IOC commit.
 
-        Uses iocs and channel_ioc_ids snapshots taken at commit time so reads
-        are consistent even when other IOC commits run concurrently in threads.
+        Queries CF for channels already registered under this IOC, classifies
+        each as old-only (re-assign or orphan), old-and-new (update in place),
+        or new-only (create or move from another IOC), then writes the result
+        via _cf_set_chunked. Raises CancelledError if self.cancelled is set.
         """
         log.info("CF Update IOC: %s", ioc_info)
         log.debug("CF Update IOC: %s record_info_by_name %s", ioc_info, record_info_by_name)
@@ -556,18 +532,18 @@ class CFProcessor(service.Service):
         new_channels = set(record_info_by_name.keys())
         iocid = ioc_info.id
 
-        if iocid not in iocs and record_info_by_name:
-            # Disconnect-before-upload is already logged in _prepare_commit.
+        if iocid not in self.iocs and record_info_by_name:
+            # Disconnect-before-upload is already logged in _commit_with_thread.
             log.warning(
                 "IOC %s committed update without prior initial transaction (%d IOCs known)",
                 ioc_info,
-                len(iocs),
+                len(self.iocs),
             )
 
         if ioc_info.hostname is None or ioc_info.ioc_name is None:
             raise IOCMissingInfoError(ioc_info)
 
-        self._assert_not_cancelled(iocid, f"before fetching old channels for {ioc_info}")
+        self._assert_not_cancelled(f"before fetching old channels for {ioc_info}")
 
         channels: List[CFChannel] = []
         log.debug("Find existing channels by IOCID: %s", ioc_info)
@@ -583,12 +559,11 @@ class CFProcessor(service.Service):
                 channels,
                 record_info_by_name,
                 iocid,
-                iocs,
-                channel_ioc_ids,
             )
+        # now pvNames contains a list of pv's new on this host/ioc
         existing_channels = self._get_existing_channels(new_channels)
 
-        self._assert_not_cancelled(iocid, f"after fetching existing channels for {ioc_info}")
+        self._assert_not_cancelled(f"after fetching existing channels for {ioc_info}")
 
         self._process_new_channels(
             new_channels, record_info_by_name, ioc_info, recceiverid, existing_channels, channels, iocid
@@ -600,6 +575,7 @@ class CFProcessor(service.Service):
         else:
             if old_channels and len(old_channels) != 0:
                 self._cf_set_chunked(channels)
+        self._assert_not_cancelled(f"after setting channels for {ioc_info}")
 
     def _process_new_channels(
         self,
@@ -611,6 +587,11 @@ class CFProcessor(service.Service):
         channels: List[CFChannel],
         iocid: str,
     ) -> None:
+        """Build CF channel objects for all channels new in this commit.
+
+        Channels already in CF under a different IOC are updated in place;
+        genuinely new channels are created fresh. Appends results to channels.
+        """
         for channel_name in new_channels:
             new_properties = create_ioc_properties(
                 ioc_info.owner,
@@ -651,8 +632,6 @@ class CFProcessor(service.Service):
         channels: List[CFChannel],
         record_info_by_name: Dict[str, RecordInfo],
         iocid: str,
-        iocs: Dict[str, IOCInfo],
-        channel_ioc_ids: Dict[str, List[str]],
     ) -> None:
         """Handle channels already present in Channelfinder for this IOC.
 
@@ -663,17 +642,26 @@ class CFProcessor(service.Service):
         for cf_channel in old_channels:
             if not new_channels or cf_channel.name in records_to_delete:
                 log.debug("Channel %s exists in Channelfinder not in new_channels", cf_channel)
-                if cf_channel.name in channel_ioc_ids:
-                    self._handle_channel_is_old(
-                        cf_channel, ioc_info, recceiverid, channels, record_info_by_name, iocs, channel_ioc_ids
-                    )
+                if cf_channel.name in self.channel_ioc_ids:
+                    last_ioc_id = self.channel_ioc_ids[cf_channel.name][-1]
+                    last_ioc_info = self.iocs.get(last_ioc_id)
+                    if last_ioc_info is None:
+                        log.warning(
+                            "Last IOC %s for channel %s not in local state; orphaning channel",
+                            last_ioc_id,
+                            cf_channel.name,
+                        )
+                        self._orphan_channel(cf_channel, ioc_info, channels, record_info_by_name)
+                    else:
+                        self._handle_channel_is_old(
+                            cf_channel, ioc_info, recceiverid, channels, record_info_by_name, last_ioc_id, last_ioc_info
+                        )
                 else:
                     self._orphan_channel(cf_channel, ioc_info, channels, record_info_by_name)
-            else:
-                if cf_channel.name in new_channels:
-                    self._handle_channel_old_and_new(
-                        cf_channel, iocid, ioc_info, channels, new_channels, record_info_by_name, old_channels
-                    )
+            elif cf_channel.name in new_channels:
+                self._handle_channel_old_and_new(
+                    cf_channel, iocid, ioc_info, channels, new_channels, record_info_by_name, old_channels
+                )
 
     def _handle_channel_is_old(
         self,
@@ -682,14 +670,18 @@ class CFProcessor(service.Service):
         recceiverid: str,
         channels: List[CFChannel],
         record_info_by_name: Dict[str, RecordInfo],
-        iocs: Dict[str, IOCInfo],
-        channel_ioc_ids: Dict[str, List[str]],
+        last_ioc_id: str,
+        last_ioc_info: IOCInfo,
     ) -> None:
-        """Channel exists in CF but not in this commit — re-assign to its last known IOC."""
-        last_ioc_id = channel_ioc_ids[cf_channel.name][-1]
-        cf_channel.owner = iocs[last_ioc_id].owner
+        """Re-assign a CF channel to its last known IOC.
+
+        Called when a channel exists in CF but not in the current commit and its last
+        known IOC is still in local state. Caller is responsible for the None check on
+        last_ioc_info and must orphan the channel instead when it is absent.
+        """
+        cf_channel.owner = last_ioc_info.owner
         cf_channel.properties = _merge_property_lists(
-            create_default_properties(ioc_info, recceiverid, channel_ioc_ids, iocs, cf_channel),
+            create_default_properties(ioc_info, recceiverid, self.channel_ioc_ids, self.iocs, cf_channel),
             cf_channel,
             self.managed_properties,
         )
@@ -700,11 +692,16 @@ class CFProcessor(service.Service):
                 for alias_name in record_info_by_name[cf_channel.name].aliases:
                     # Legacy alias handling retained to avoid changing runtime behavior.
                     alias_channel = CFChannel(alias_name, "", [])
-                    if alias_name in channel_ioc_ids:
-                        last_alias_ioc_id = channel_ioc_ids[alias_name][-1]
-                        alias_channel.owner = iocs[last_alias_ioc_id].owner
+                    if alias_name in self.channel_ioc_ids:
+                        last_alias_ioc_id = self.channel_ioc_ids[alias_name][-1]
+                        last_alias_ioc_info = self.iocs.get(last_alias_ioc_id)
+                        if last_alias_ioc_info is None:
+                            continue
+                        alias_channel.owner = last_alias_ioc_info.owner
                         alias_channel.properties = _merge_property_lists(
-                            create_default_properties(ioc_info, recceiverid, channel_ioc_ids, iocs, cf_channel),
+                            create_default_properties(
+                                ioc_info, recceiverid, self.channel_ioc_ids, self.iocs, cf_channel
+                            ),
                             alias_channel,
                             self.managed_properties,
                         )

@@ -1,15 +1,25 @@
-from unittest.mock import MagicMock
+import time
 
+import pytest
 from requests import RequestException
 from twisted.internet import defer
 from twisted.internet.address import IPv4Address
-from twisted.internet.defer import DeferredLock
 
 from recceiver.cf.model import CFChannel, CFProperty, CFPropertyName, PVStatus, RecordInfo
-from recceiver.cf.processor import CFProcessor, CFUpdateAbortedError
+from recceiver.cf.processor import CFProcessor
+from recceiver.recast import Transaction
 from tests.unit.cf.conftest import DEFAULT_RECCEIVER_ID, make_channel, make_ioc
 from tests.unit.cf.mock_adapter import MockCFAdapter
 from tests.unit.conftest import make_adapter
+
+_HOST_A = "1.2.3.4"  # NOSONAR
+
+
+def make_transaction(host: str, port: int) -> Transaction:
+    ep = IPv4Address("TCP", host, port)
+    t = Transaction(ep, id=0)
+    t.initial = True
+    return t
 
 
 def make_processor() -> CFProcessor:
@@ -21,16 +31,6 @@ def make_processor_with_mock():
     adapter = MockCFAdapter()
     proc.client = adapter
     return proc, adapter
-
-
-_HOST_A = "1.2.3.4"  # NOSONAR
-_HOST_B = "5.6.7.8"  # NOSONAR
-
-
-def make_transaction(host: str = _HOST_A, port: int = 5064) -> MagicMock:
-    t = MagicMock()
-    t.source_address = IPv4Address("TCP", host, port)
-    return t
 
 
 class TestRemoveChannel:
@@ -91,7 +91,7 @@ class TestCleanService:
 class TestUpdateChannelFinder:
     def _make_proc(self):
         proc, adapter = make_processor_with_mock()
-        proc.running = True
+        proc.cancelled = False
         proc.managed_properties = set()
         proc.record_property_names_list = set()
         proc.env_vars = {}
@@ -102,7 +102,7 @@ class TestUpdateChannelFinder:
         ioc = make_ioc()
         proc.iocs[ioc.id] = ioc
 
-        proc._update_channelfinder({"PV:1": RecordInfo(pv_name="PV:1")}, [], ioc, proc.iocs, proc.channel_ioc_ids)
+        proc._update_channelfinder({"PV:1": RecordInfo(pv_name="PV:1")}, [], ioc)
 
         assert "PV:1" in adapter._channels
         status = next(p for p in adapter._channels["PV:1"].properties if p.name == CFPropertyName.PV_STATUS.value)
@@ -128,181 +128,169 @@ class TestUpdateChannelFinder:
             ]
         )
 
-        proc._update_channelfinder({}, [], ioc, proc.iocs, proc.channel_ioc_ids)
+        proc._update_channelfinder({}, [], ioc)
 
+        status = next(p for p in adapter._channels["PV:1"].properties if p.name == CFPropertyName.PV_STATUS.value)
+        assert status.value == PVStatus.INACTIVE.value
+
+    def test_handle_channel_is_old_missing_last_ioc_does_not_raise(self):
+        """If the last known IOC for a channel has departed, orphan the channel rather than raise."""
+        from recceiver.cf.model import IOCInfo
+
+        proc, adapter = self._make_proc()
+
+        ioc_a = IOCInfo(
+            host="1.2.3.4",  # NOSONAR
+            hostname="ioc-a.example.com",
+            ioc_name="IOC-A",
+            ioc_ip="1.2.3.4",  # NOSONAR
+            owner="admin",
+            time="2026-01-01T00:00:00",
+            port=5064,
+            channelcount=0,
+        )
+        ioc_b = IOCInfo(
+            host="5.6.7.8",  # NOSONAR
+            hostname="ioc-b.example.com",
+            ioc_name="IOC-B",
+            ioc_ip="5.6.7.8",  # NOSONAR
+            owner="admin",
+            time="2026-01-01T00:00:00",
+            port=5064,
+            channelcount=0,
+        )
+        ioc_a_id = ioc_a.id  # "1.2.3.4:5064"
+        ioc_b_id = ioc_b.id  # "5.6.7.8:5064"
+
+        # PV:1 was last seen under IOC-A, which has since departed
+        proc.channel_ioc_ids["PV:1"].append(ioc_a_id)
+        # ioc_a deliberately absent from proc.iocs
+        proc.iocs[ioc_b_id] = ioc_b
+
+        # CF has PV:1 registered under IOC-B (by iocid property)
+        adapter.set_channels(
+            [
+                CFChannel(
+                    "PV:1",
+                    "admin",
+                    [
+                        CFProperty(CFPropertyName.PV_STATUS.value, "admin", PVStatus.ACTIVE.value),
+                        CFProperty(CFPropertyName.IOC_ID.value, "admin", ioc_b_id),
+                    ],
+                )
+            ]
+        )
+
+        # IOC-B commits with no channels — PV:1 appears in old_channels, triggers _handle_channel_is_old
+        proc._update_channelfinder({}, [], ioc_b)
+
+        # Must not raise KeyError; PV:1 should be orphaned (marked Inactive)
         status = next(p for p in adapter._channels["PV:1"].properties if p.name == CFPropertyName.PV_STATUS.value)
         assert status.value == PVStatus.INACTIVE.value
 
 
 class TestPushToCF:
-    """Tests for _push_to_cf_async: retry abandonment when stopped or cancelled."""
-
-    def _run_async_push(self, monkeypatch, processor, ioc, side_effect_fn):
-        iocid = ioc.id
-        processor._cancelled[iocid] = False
-
-        def sync_thread(fn, *args):
-            try:
-                fn(*args)
-                return defer.succeed(None)
-            except Exception as exc:
-                return defer.fail(exc)
-
-        monkeypatch.setattr("recceiver.cf.processor.deferToThread", sync_thread)
-        monkeypatch.setattr("recceiver.cf.processor.task.deferLater", lambda *a, **kw: defer.succeed(None))
-        monkeypatch.setattr(processor, "_update_channelfinder", side_effect_fn)
-
-        results, errors = [], []
-        processor._push_to_cf_async(iocid, {}, [], ioc, {}, {}).addCallbacks(results.append, errors.append)
-        return results, errors
-
     def test_abandons_push_when_processor_stops_during_retry(self, monkeypatch):
+        monkeypatch.setattr(time, "sleep", lambda _: None)
+
         processor = make_processor()
         processor.running = True
         processor.cf_config.push_always_retry = True
-        ioc = make_ioc()
-        call_count = [0]
 
-        def failing_update(*args):
-            call_count[0] += 1
+        call_count = 0
+
+        def failing_update(record_info_by_name, records_to_delete, ioc_info):
+            nonlocal call_count
+            call_count += 1
             processor.running = False
             raise RequestException("CF unreachable")
 
-        results, errors = self._run_async_push(monkeypatch, processor, ioc, failing_update)
-        assert len(results) == 1 and len(errors) == 0
-        assert call_count[0] == 1
+        monkeypatch.setattr(processor, "_update_channelfinder", failing_update)
+        result = processor._push_to_cf({}, [], make_ioc())
 
-    def test_abandons_push_when_ioc_cancelled_during_retry(self, monkeypatch):
+        assert result is False
+        assert call_count == 1
+
+    def test_gives_up_after_max_retries(self, monkeypatch):
+        monkeypatch.setattr(time, "sleep", lambda _: None)
+
         processor = make_processor()
         processor.running = True
-        processor.cf_config.push_always_retry = True
-        ioc = make_ioc()
-        iocid = ioc.id
-        call_count = [0]
+        processor.cf_config.push_always_retry = False
+        processor.cf_config.push_max_retries = 2
 
-        def failing_update(*args):
-            call_count[0] += 1
-            processor._cancelled[iocid] = True
+        call_count = 0
+
+        def failing_update(record_info_by_name, records_to_delete, ioc_info):
+            nonlocal call_count
+            call_count += 1
             raise RequestException("CF unreachable")
 
-        results, errors = self._run_async_push(monkeypatch, processor, ioc, failing_update)
-        assert len(results) == 1 and len(errors) == 0
-        assert call_count[0] == 1
+        monkeypatch.setattr(processor, "_update_channelfinder", failing_update)
+        result = processor._push_to_cf({}, [], make_ioc())
+
+        assert result is False
+        assert call_count == 2
+
+    def test_cancelled_flag_raises_cancelled_error(self):
+        processor = make_processor()
+        processor.running = True
+        processor.cancelled = True
+        ioc = make_ioc()
+        processor.iocs[ioc.id] = ioc
+
+        with pytest.raises(defer.CancelledError):
+            processor._push_to_cf({}, [], ioc)
 
 
-class TestPerIocLocking:
-    def test_different_iocs_get_different_locks(self):
+class TestEvictIoc:
+    def test_evict_ioc_removes_all_tracking_state(self):
         proc = make_processor()
-        lock_a = proc._get_ioc_lock(f"{_HOST_A}:5064")
-        lock_b = proc._get_ioc_lock(f"{_HOST_B}:5064")
-        assert lock_a is not lock_b
+        ioc = make_ioc(channelcount=2)
+        iocid = ioc.id
+        proc.iocs[iocid] = ioc
+        proc._ioc_channels[iocid].add("PV:1")
+        proc._ioc_channels[iocid].add("PV:2")
+        proc.channel_ioc_ids["PV:1"].append(iocid)
+        proc.channel_ioc_ids["PV:2"].append(iocid)
 
-    def test_same_ioc_gets_same_lock(self):
-        proc = make_processor()
-        lock1 = proc._get_ioc_lock(f"{_HOST_A}:5064")
-        lock2 = proc._get_ioc_lock(f"{_HOST_A}:5064")
-        assert lock1 is lock2
+        proc._evict_ioc(iocid)
 
-    def test_commit_routes_to_correct_iocid(self, monkeypatch):
-        proc = make_processor()
-        routed_iocids = []
-
-        def fake_lock_run(fn, transaction, iocid):
-            routed_iocids.append(iocid)
-            return defer.succeed(None)
-
-        lock = DeferredLock()
-        monkeypatch.setattr(lock, "run", fake_lock_run)
-        monkeypatch.setattr(proc, "_get_ioc_lock", lambda _iocid: lock)
-
-        proc.commit(make_transaction(_HOST_A, 5064))
-        assert routed_iocids == [f"{_HOST_A}:5064"]
-
-    def test_prune_removes_state_after_ioc_disconnects(self):
-        proc = make_processor()
-        iocid = f"{_HOST_A}:5064"
-        proc._ioc_locks[iocid] = DeferredLock()
-        proc._cancelled[iocid] = False
-        proc._ioc_channels[iocid].add("CHAN:1")
-
-        # iocid is NOT in proc.iocs → IOC has disconnected
-        proc._prune_ioc_state(None, iocid)
-
-        assert iocid not in proc._ioc_locks
-        assert iocid not in proc._cancelled
+        assert iocid not in proc.iocs
         assert iocid not in proc._ioc_channels
+        assert "PV:1" not in proc.channel_ioc_ids
+        assert "PV:2" not in proc.channel_ioc_ids
 
-    def test_prune_preserves_state_while_ioc_is_active(self):
+    def test_evict_ioc_is_noop_for_unknown_ioc(self):
         proc = make_processor()
-        iocid = f"{_HOST_A}:5064"
-        proc._ioc_locks[iocid] = DeferredLock()
-        proc._cancelled[iocid] = False
-        proc.iocs[iocid] = make_ioc()
+        proc._evict_ioc("1.2.3.4:5064")  # NOSONAR — must not raise
 
-        proc._prune_ioc_state(None, iocid)
-
-        assert iocid in proc._ioc_locks
-        assert iocid in proc._cancelled
-
-    def test_prune_passes_result_through(self):
-        proc = make_processor()
-        iocid = f"{_HOST_A}:5064"
-        assert proc._prune_ioc_state("sentinel", iocid) == "sentinel"
-
-
-class TestCommitErrorHandling:
-    """Test _commit_with_lock error routing without running real threads.
-
-    _prepare_commit is simulated via a monkeypatched deferToThread; the CF
-    push phase is controlled by patching _push_to_cf_async directly so each
-    test exercises exactly one failure mode at a time.
-    """
-
-    def _run(self, monkeypatch, *, prepare_result, push_result=None):
+    def test_commit_thread_evicts_ioc_on_push_failure(self, monkeypatch):
+        """On retry exhaustion for a connected transaction, IOC is evicted from memory."""
         proc = make_processor()
         proc.running = True
-        iocid = f"{_HOST_A}:5064"
-        monkeypatch.setattr("recceiver.cf.processor.deferToThread", lambda *_a, **_kw: prepare_result)
-        if push_result is not None:
-            monkeypatch.setattr(proc, "_push_to_cf_async", lambda *_a, **_kw: push_result)
+        ioc = make_ioc(channelcount=1)
+        iocid = ioc.id
 
-        results, errors = [], []
-        proc._commit_with_lock(make_transaction(), iocid).addCallbacks(results.append, errors.append)
-        return results, errors
+        # Pre-populate state as update_ioc_infos would have done
+        proc.iocs[iocid] = ioc
+        proc._ioc_channels[iocid].add("PV:1")
+        proc.channel_ioc_ids["PV:1"].append(iocid)
 
-    def test_aborted_commit_resolves_chain(self, monkeypatch):
-        """CFUpdateAbortedError from exhausted retries lets the chain continue."""
-        ioc = make_ioc()
-        results, errors = self._run(
-            monkeypatch,
-            prepare_result=defer.succeed((ioc, {}, [], {}, {})),
-            push_result=defer.fail(CFUpdateAbortedError("retries exhausted")),
-        )
-        assert len(results) == 1 and len(errors) == 0
+        # Skip update_ioc_infos (state already set up) and fail the CF push
+        monkeypatch.setattr(proc, "update_ioc_infos", lambda *a: None)
+        monkeypatch.setattr(proc, "_push_to_cf", lambda *a: False)
+        monkeypatch.setattr(proc, "transaction_to_record_infos", lambda *a: {})
+        monkeypatch.setattr(CFProcessor, "record_info_by_name", staticmethod(lambda *a: {}))
 
-    def test_unexpected_error_errbacks_chain(self, monkeypatch):
-        ioc = make_ioc()
-        results, errors = self._run(
-            monkeypatch,
-            prepare_result=defer.succeed((ioc, {}, [], {}, {})),
-            push_result=defer.fail(RuntimeError("unexpected")),
-        )
-        assert len(results) == 0 and len(errors) == 1
-        assert errors[0].check(RuntimeError)
+        t = make_transaction(_HOST_A, 5064)
+        t.connected = True
+        t.records_to_delete = []
+        t.client_infos = {"IOCNAME": "TEST-IOC", "HOSTNAME": "test.host"}
 
-    def test_service_stopped_cancel_errbacks_chain(self, monkeypatch):
-        results, errors = self._run(
-            monkeypatch,
-            prepare_result=defer.fail(defer.CancelledError("service stopped")),
-        )
-        assert len(results) == 0 and len(errors) == 1
-        assert errors[0].check(defer.CancelledError)
+        with pytest.raises(defer.CancelledError):
+            proc._commit_with_thread(t)
 
-    def test_successful_commit_resolves_chain(self, monkeypatch):
-        ioc = make_ioc()
-        results, errors = self._run(
-            monkeypatch,
-            prepare_result=defer.succeed((ioc, {}, [], {}, {})),
-            push_result=defer.succeed(None),
-        )
-        assert len(results) == 1 and len(errors) == 0
+        assert iocid not in proc.iocs
+        assert iocid not in proc._ioc_channels
+        assert "PV:1" not in proc.channel_ioc_ids
