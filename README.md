@@ -2,9 +2,9 @@ RecSync
 =======
 
 The record synchronizer project includes two parts.
-A client ([RecCaster](./client/README.md)) which runing as part of an EPICS
-IOC, and a server ([RecCeiver](./server/README.md)) which is a stand alone
-daemon.  Together they work to ensure the the server(s)
+A client [RecCaster](https://github.com/ChannelFinder/reccaster) which runing
+as part of an EPICS IOC, and a server ([RecCeiver](./server/README.md))
+which is a stand alone daemon.  Together they work to ensure the the server(s)
 have a complete list of all records currently provided
 by the client IOCs.
 
@@ -19,17 +19,6 @@ about its Process Database.
 * The name, type, and description of all records
 * Any info() tags associated with these records
 * Any additional environment variables specified in addReccasterEnvVars iocsh calls
-
-RecCaster Usage
----------------
-
-The RecCaster source in the `client/` sub-directory
-is build as an EPICS support module.
-It provides `reccaster.dbd` and the `reccaster` library.
-The client demo IOC in `client/demoApp/` provides
-an example of how to build RecCaster into an IOC.
-
-RecCaster requires only EPICS Base 3.15 and later 3.14 releases.
 
 RecCeiver Usage
 ---------------
