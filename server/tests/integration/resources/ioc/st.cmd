@@ -1,5 +1,5 @@
 ## Register all support components
-dbLoadDatabase("/recsync/dbd/demo.dbd",0,0)
+dbLoadDatabase("/reccaster/dbd/demo.dbd",0,0)
 demo_registerRecordDeviceDriver(pdbbase)
 
 var(reccastTimeout, 5.0)
